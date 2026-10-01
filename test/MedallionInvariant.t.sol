@@ -93,6 +93,15 @@ contract MedallionInvariantTest is Test {
         hook = handler.hook_();
         manager = handler.manager_();
         targetContract(address(handler));
+        // Only the five actions. Without this list the fuzzer also calls the handler's public setUp(),
+        // which redeploys the hook mid-sequence and leaves the invariants reading a stale one.
+        bytes4[] memory selectors = new bytes4[](5);
+        selectors[0] = MedallionHandler.swap.selector;
+        selectors[1] = MedallionHandler.donateClaims.selector;
+        selectors[2] = MedallionHandler.retire.selector;
+        selectors[3] = MedallionHandler.burn.selector;
+        selectors[4] = MedallionHandler.closeOrOpenPool4.selector;
+        targetSelector(FuzzSelector({addr: address(handler), selectors: selectors}));
     }
 
     function invariant_claimsCoverTheLedger() public view {

@@ -11,10 +11,25 @@ batches and sends it to the same address.
 
 ## Disclosure
 
-The petition above is fiction written by the medallion's owner, who commissioned and paid for this
-work. `CREATOR` (`0x70c6C4fcaAb11151FCEDb32eaaC3431547193A0a`) is the requester's own wallet. The
-1.64 ETH payout to it is intended, and it is the only ETH the hook ever sends to that address. This is
-stated here, in `launch.json` notes and in the contract's NatSpec.
+The petition above is fiction written by the requester, who commissioned and paid for this work.
+`CREATOR` (`0x70c6C4fcaAb11151FCEDb32eaaC3431547193A0a`) is the requester's own wallet. The 1.64 ETH
+payout to it is intended, and it is the only ETH the hook ever sends to that address. This is stated
+here, in `launch.json` notes and in the contract's NatSpec.
+
+**Who actually owns medallion #447.** `MEDALLION_NFT` (`0x9C8fF314C9Bc7F6e59A9d9225Fb22946427eDC03`,
+fixed by the brief) is, on Ethereum mainnet, the Nouns ERC-721 (`name()` "Nouns", `symbol()` "NOUN").
+Checked at block 26098044 on 2026-10-01: `ownerOf(447)` is `0xb1a32FC9F9D8b2cf86C068Cae13108809547ef71`,
+the Nouns DAO treasury timelock (`delay()` 172800), which holds 649 Nouns; `CREATOR` holds none;
+`getApproved(447)` is zero and the timelock has not approved `CREATOR` or this hook. The petition's
+"my owner paid 1.64 ETH for me" is part of the fiction. Consequences:
+
+- `retire()` can only succeed after a **passed Nouns DAO proposal** either approves this hook for
+  Noun #447 (`approve(hook, 447)` / `setApprovalForAll(hook, true)` executed by the timelock) or
+  transfers Noun #447 to `0x...dEaD` itself (then `retire()` skips the transfer and only pays).
+- Until that happens every `retire()` reverts `RetireRefused`, `creatorPaid` stays 0, `status()` stays
+  `RECOUPED, NOT RETIRED`, and the first 1.64 ETH of fees sits as claims in the hook with **no other
+  exit** (no sweep, by design). It may never be released.
+- Fees above the cap are burnable regardless; burns do not depend on retirement.
 
 The medallion collection, the $IMD token and the POOL4 market exist on Ethereum mainnet only. The
 constants are kept on every chain. On Sepolia the fee accrues normally, `retire()` reverts with
@@ -71,7 +86,8 @@ fixed pool keys: POOL4 `(ETH, IMD, 10000, 60, POOL4_HOOK)` and plain `(ETH, IMD,
 Checks, in order: `TooSoon` (fewer than 5 blocks since `lastBurnBlock`, which the constructor sets to
 the deployment block); `Pool4Unavailable` (fallback mode with `viaPool4`, or POOL4 never read);
 `batch = min(burnable, 0.05 ETH normal / 0.01 ETH fallback)`; `NothingToBurn` under 0.002 ETH; then
-the guards.
+the reference is resolved (seed or anchor step), the pool is read (`PoolUnavailable` if it is not
+initialized) and the guards run.
 
 - *Normal mode*: POOL4's `marketOpen()` returns true and `refTick()` answers (low-level staticcall,
   length and range checked, no staleness rule). The reference is `refTick`, and it is also written to
@@ -79,7 +95,11 @@ the guards.
 - *Fallback mode*: only the plain pool. The reference is the anchor as it stood at the start of the
   block. The anchor then steps at most `ANCHOR_STEP = 200` ticks toward the plain pool's spot, clamped
   to `lastRef ± FALLBACK_BAND (1000)`, once per block however long it idled. `pokeAnchor()` does the
-  same step without burning, and re-seeds from POOL4 while it answers.
+  same step without burning, and re-seeds from POOL4 while it answers. Once
+  `FALLBACK_RECENTER_BLOCKS = 100` blocks have passed since `lastRef` was written, the next step first
+  re-centres `lastRef` on the anchor (`BandRecentered`), so a lasting move of the plain pool beyond the
+  band is followed at no more than 1000 ticks per 100 blocks instead of stranding the burns for good.
+  A re-seed from POOL4 resets that clock.
 - *One-sided guard*: `PriceOffReference` only when `spot < reference - tolerance`; tolerance is
   `MAX_PLAIN_DEVIATION = 300` for the plain pool in normal mode, `MAX_REF_DEVIATION = 150` otherwise.
   A pool where $IMD is cheaper than the reference is never refused.
@@ -119,6 +139,7 @@ transfer, no ETH to `CREATOR` except the one cap in `retire()`, no caller-chosen
 | `MAX_REF_DEVIATION` / `MAX_PLAIN_DEVIATION` | 150 / 300 ticks |
 | `MAX_SLIPPAGE_BPS` | 400 |
 | `ANCHOR_STEP` / `FALLBACK_BAND` | 200 / 1000 ticks |
+| `FALLBACK_RECENTER_BLOCKS` | 100 blocks |
 
 ## Interface
 
@@ -126,10 +147,11 @@ Hook callbacks (PoolManager only): `afterInitialize`, `beforeSwap`, `afterSwap`,
 Permissionless: `retire()`, `burnIMD(bool viaPool4, uint256 callerMinOut)`, `pokeAnchor()`.
 Views: `status()`, `totalFees()`, `creatorPaid()`, `burnSpent()`, `imdBurned()`, `retired()`,
 `creatorEntitlement()`, `burnable()`, `reservedClaims()`, `launchPool()`, `launchPoolSet()`,
-`lastBurnBlock()`, `anchorSeeded()`, `anchor()`, `blockAnchor()`, `lastRef()`, `anchorBlock()`,
-`pool4Key()`, `plainKey()`, `quote(amount, tick)`, `pool4Reference()`, `getHookPermissions()`.
+`lastBurnBlock()`, `anchorSeeded()`, `anchor()`, `blockAnchor()`, `lastRef()`, `lastRefBlock()`,
+`anchorBlock()`, `pool4Key()`, `plainKey()`, `quote(amount, tick)`, `pool4Reference()`,
+`getHookPermissions()`.
 Events: `LaunchPoolSet`, `FeeCollected`, `Recouped`, `MedallionRetired`, `CreatorPaid`, `LastFare`,
-`AnchorSeeded`, `AnchorStepped`, `IMDBurned`. ABIs: `docs/abi/MedallionHook.json`,
+`AnchorSeeded`, `AnchorStepped`, `BandRecentered`, `IMDBurned`. ABIs: `docs/abi/MedallionHook.json`,
 `docs/abi/FareToken.json`.
 
 ## Build and test (offline)
@@ -143,7 +165,7 @@ forge test --offline
 forge fmt --check
 ```
 
-The suite has 89 unit and fuzz tests plus 4 invariants (see `test/`). Tests deploy their own
+The suite has 96 unit and fuzz tests plus 4 invariants (see `test/`). Tests deploy their own
 PoolManager, mine a CREATE2 salt for the 0x10CC flags, and `vm.etch` mocks at the mainnet addresses of
 the medallion, $IMD and the POOL4 hook. No environment variables, no ffi, no filesystem access.
 
@@ -158,20 +180,35 @@ the medallion, $IMD and the POOL4 hook. No environment variables, no ffi, no fil
   assumption**: the brief sets no price. The deployer may change it; nothing in the hook depends on it.
 - Target chain: Ethereum mainnet is where `retire()` and `burnIMD()` can succeed. Elsewhere only the
   fee works.
+- **Deploy and initialize atomically.** `launchPool` is whichever native-ETH pool naming this hook
+  is initialized first, with no setter. The factory must deploy the hook and initialize the
+  ETH/FARE447 pool in the same transaction (it does; before deployment the hook has no code and no
+  pool can be initialized against it). If the two were ever split, a stranger could initialize any
+  ETH/anything pool in between and the real FARE447 pool would trade fee-free forever.
 
 ## Operational responsibilities
 
-- **The medallion's owner** must `approve(hook, 447)` or `setApprovalForAll(hook, true)` on the
-  medallion contract before `retire()` can succeed. Without it, `retire()` reverts `RetireRefused`
-  and nothing changes. After the approval anyone may send the transaction.
+- **Nouns DAO, not CREATOR, holds Noun #447** (see Disclosure). Before `retire()` can succeed a
+  Nouns DAO proposal must pass and execute `approve(hook, 447)` or `setApprovalForAll(hook, true)` on
+  `0x9C8fF314C9Bc7F6e59A9d9225Fb22946427eDC03`, or transfer Noun #447 to `0x...dEaD`. Without it
+  `retire()` reverts `RetireRefused` and nothing changes; the 1.64 ETH stays locked, possibly forever.
+  After the approval anyone may send the transaction.
 - **CREATOR** must be able to receive plain ETH from the PoolManager's `take`. If it cannot, `retire()`
   reverts until it can. Trading is unaffected either way because fees are claims.
-- **Keepers.** `burnIMD` and `pokeAnchor` pay nothing. Someone has to call them: a bot, the owner, or
-  anybody with a reason. Burns are capped at one every 5 blocks and 0.05 ETH (0.01 in fallback).
+- **Keepers.** `burnIMD` and `pokeAnchor` pay nothing. Someone has to call them: a bot, the requester,
+  or anybody with a reason. Burns are capped at one every 5 blocks and 0.05 ETH (0.01 in fallback).
 - **POOL4.** `marketOpen()` and `refTick()` on the POOL4 hook were confirmed on mainnet while this was
-  written (open, tick 60396). If POOL4 ever stops answering, burns continue on the plain pool at
-  0.01 ETH per batch using the anchored reference, as long as POOL4 answered at least once (at
-  deployment or later).
+  written (open, tick 60396). The live POOL4 hook has an owner-only, terminal `closeMarket()`; if it is
+  ever used, this hook is in fallback mode for life: burns continue on the plain pool at 0.01 ETH per
+  batch with the anchored reference, which follows the plain pool at 200 ticks per block inside a
+  ±1000 band that re-centres every 100 blocks. Burns never depend on POOL4 reopening, but they do
+  need POOL4 to have answered at least once (at deployment or later).
+- **The plain pool is permissionless.** Anyone can create and solely supply `(ETH, IMD, 10000, 200,
+  no hook)`. Inside the brief's fixed tolerances such an LP can sell $IMD to the hook at up to about
+  3.9% below POOL4's reference per 0.05 ETH batch in normal mode (300 ticks of deviation plus the 96%
+  floor), and up to roughly 15% on 0.01 ETH batches in fallback mode after walking the anchor. That is
+  about 0.002 ETH per batch, below mainnet gas for the call; it is a bound, not an exploit, and the
+  creator's reserve is never touched.
 - Nobody can change anything after deployment.
 
 ## What the brief asked that the launch token does not do

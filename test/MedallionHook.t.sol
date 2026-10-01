@@ -92,6 +92,7 @@ contract MedallionHookTest is MedallionTestBase {
         assertEq(hook.MAX_SLIPPAGE_BPS(), 400);
         assertEq(hook.ANCHOR_STEP(), 200);
         assertEq(hook.FALLBACK_BAND(), 1000);
+        assertEq(hook.FALLBACK_RECENTER_BLOCKS(), 100);
     }
 
     function test_lastFareIsPinned() public view {

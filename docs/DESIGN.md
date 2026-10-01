@@ -66,11 +66,11 @@ back into `retire()` from `transferFrom` makes the outer call revert `RetireRefu
 
 ```
 TooSoon            if block.number < lastBurnBlock + 5
-open, ref = POOL4.marketOpen(), POOL4.refTick()      (staticcalls, length == 32, 0 < flag == 1, tick in range)
-normal   (open):   seed anchor = blockAnchor = lastRef = ref; reference = ref
-fallback (!open):  Pool4Unavailable if viaPool4 or !anchorSeeded
-                   stepAnchor(); reference = blockAnchor
+open, ref = POOL4.marketOpen(), POOL4.refTick()      (staticcalls, length == 32, flag == 1, tick in range)
+Pool4Unavailable   if !open and (viaPool4 or !anchorSeeded)
 batch = min(burnable, open ? 0.05 : 0.01 ETH); NothingToBurn if batch < 0.002 ETH
+normal   (open):   seed anchor = blockAnchor = lastRef = ref, lastRefBlock = block; reference = ref
+fallback (!open):  stepAnchor(); reference = blockAnchor
 key   = viaPool4 ? POOL4 : plain
 spot  = slot0(key).tick;  PoolUnavailable if the pool is not initialized
 tol   = (!viaPool4 && open) ? 300 : 150
@@ -87,12 +87,16 @@ imdBurned += out; emit IMDBurned
 ### The anchor
 
 `anchor` is the fallback reference. `blockAnchor` is the value `anchor` had when the block in which it
-last moved began. `anchorBlock` is that block. `lastRef` is the last POOL4 reference.
+last moved began. `anchorBlock` is that block. `lastRef` is the centre of the band: the last POOL4
+reference, or the anchor as of the last re-centre. `lastRefBlock` is the block `lastRef` was written.
 
 `stepAnchor()` runs at most once per block:
 
 ```
 if anchorBlock == block.number: return
+plainSpot   = slot0(plain).tick                      (PoolUnavailable if not initialized)
+if block.number >= lastRefBlock + 100:               (FALLBACK_RECENTER_BLOCKS)
+    lastRef = anchor; lastRefBlock = block.number    emit BandRecentered
 target      = clamp(plainSpot, lastRef - 1000, lastRef + 1000)
 blockAnchor = anchor
 anchor     += clamp(target - anchor, -200, +200)
@@ -104,6 +108,19 @@ the reference a burn uses; the reference can only change between blocks, by at m
 block, and never leaves `lastRef ± 1000`. An attacker who pushes the plain pool down must wait for the
 anchor to walk down 200 ticks per block before a burn at the depressed price passes the guard, and
 each such burn is at most 0.01 ETH every 5 blocks.
+
+### Why the band re-centres
+
+Without the re-centre, `lastRef` was written only while POOL4 answered. The live POOL4 hook has an
+owner-only, terminal `closeMarket()`. After such a close the hook is in fallback mode for life, and a
+lasting plain-pool move of more than 1150 ticks below `lastRef` (IMD ~12% dearer in ETH) pinned the
+anchor at `lastRef - 1000` and made every burn revert `PriceOffReference` forever, stranding every
+post-cap fee; a move the other way pinned the anchor at `lastRef + 1000` and left the 96% floor far
+below the market. Re-centring every 100 blocks (~20 minutes on mainnet) lets the band slide to the
+anchor, so the reference follows a lasting move at no more than 1000 ticks per 100 blocks, while a
+short manipulation still has to be held across 200-tick steps and a re-centre to move the reference
+far. Within 100 blocks the hook burns at most 20 × 0.01 ETH, which bounds what a sustained false price
+can cost per re-centre interval. A re-seed from POOL4 resets `lastRef`, `anchor` and the clock.
 
 ### Why the guard is one-sided
 
@@ -119,6 +136,6 @@ places)`, zero-padded to `places` digits.
 ## Compiler and bytecode
 
 solc 0.8.26, evm `cancun`, optimizer 200 runs, `via_ir = false`, `bytecode_hash = "none"`,
-`cbor_metadata = false`. The hook runtime is about 14.4 KB. Neither runtime contains `SELFDESTRUCT`
+`cbor_metadata = false`. The hook runtime is about 14.6 KB. Neither runtime contains `SELFDESTRUCT`
 (0xff), `DELEGATECALL` (0xf4) or `CALLCODE` (0xf2) outside PUSH data; a test walks the bytecode the
 way the admission floor does.

@@ -19,14 +19,19 @@
 ## When the cap is reached
 
 - `status()` says `RECOUPED, NOT RETIRED. ...`. `Recouped` was emitted once.
-- **The owner of medallion #447** approves the hook on the medallion contract
-  (`0x9C8fF314C9Bc7F6e59A9d9225Fb22946427eDC03`): `approve(hook, 447)` or
-  `setApprovalForAll(hook, true)`.
-- Anyone calls `retire()`. One transaction: medallion to `0x...dEaD`, 1.64 ETH to `CREATOR`,
-  `MedallionRetired`, `CreatorPaid` and `LastFare` emitted.
+- **Medallion #447 is Noun #447, owned by the Nouns DAO treasury timelock**
+  (`0xb1a32FC9F9D8b2cf86C068Cae13108809547ef71`, checked 2026-10-01), not by `CREATOR`. Only a passed
+  Nouns DAO proposal can let `retire()` through, by executing on the Nouns token
+  (`0x9C8fF314C9Bc7F6e59A9d9225Fb22946427eDC03`) either `approve(hook, 447)` /
+  `setApprovalForAll(hook, true)` or `transferFrom(timelock, 0x...dEaD, 447)`. The requester has to
+  take that to Nouns governance; nobody involved in this launch can do it unilaterally.
+- Anyone calls `retire()` once that has executed. One transaction: medallion to `0x...dEaD` (skipped
+  if the DAO already sent it there), 1.64 ETH to `CREATOR`, `MedallionRetired`, `CreatorPaid` and
+  `LastFare` emitted.
 - If `retire()` reverts `RetireRefused(...)`, the approval is missing or the owner changed. Nothing
-  moved; fix the approval and retry. If it reverts `MedallionUnavailable`, the chain has no medallion
-  contract (Sepolia) or it answered badly.
+  moved; the 1.64 ETH of claims stays in the hook, which has no sweep, until a proposal passes, and
+  possibly forever. If it reverts `MedallionUnavailable`, the chain has no medallion contract
+  (Sepolia) or it answered badly.
 - Fees above the cap are already burnable before retirement; retirement is not a precondition for
   burns.
 
@@ -39,10 +44,17 @@
 - `PriceOffReference(spot, ref)` means the chosen pool prices $IMD more than 1.5% (3% for plain in
   normal mode) above the reference. Try the other pool or wait.
 - `InsufficientOutput(out, minOut)` means the pool is too thin for the batch at the moment.
+- With nothing burnable the call reverts `NothingToBurn` before any pool is read, in both modes.
+  `PoolUnavailable` means there was something to burn but the chosen pool is not initialized on this
+  manager.
 - If POOL4 stops answering (`pool4Reference()` returns `open = false`): only `burnIMD(false, …)`
   works, with the anchored reference. Call `pokeAnchor()` once per block to let the anchor follow the
-  plain pool (≤ 200 ticks per block, within ±1000 of the last POOL4 reference). If POOL4 never
-  answered since deployment, burns are impossible until it does.
+  plain pool (≤ 200 ticks per block, within ±1000 of `lastRef`). Every 100 blocks since `lastRef` was
+  last written, the next step re-centres `lastRef` on the anchor (`BandRecentered`), so after a
+  lasting move of the plain pool beyond the band the anchor catches up at ≤ 1000 ticks per 100 blocks
+  and burns resume; a keeper only has to keep poking. The live POOL4 hook's `closeMarket()` is
+  terminal, so this fallback may be permanent. If POOL4 never answered since deployment, burns are
+  impossible until it does.
 - The caller is not paid. Gas is a donation.
 
 ## Sepolia and other chains
@@ -56,7 +68,7 @@ Fees still accrue and `status()` still works. Nothing on those chains can releas
 - `Recouped(totalFees, block)` once.
 - `MedallionRetired(from)`, `CreatorPaid(creator, 1.64e18)`, `LastFare(447, hash, text)` on retirement.
 - `IMDBurned(viaPool4, fallbackMode, ethIn, imdOut, refTick, spot)` per burn;
-  `AnchorSeeded` / `AnchorStepped` as the reference moves.
+  `AnchorSeeded` / `AnchorStepped` / `BandRecentered` as the reference moves.
 - Invariant to alert on: `PoolManager.balanceOf(hook, 0) >= totalFees - creatorPaid - burnSpent`.
 
 ## Trust assumptions
@@ -64,7 +76,15 @@ Fees still accrue and `status()` still works. Nothing on those chains can releas
 - POOL4's `marketOpen()` and `refTick()` are the reference oracle in normal mode. Both were confirmed
   on mainnet (open, tick 60396) while this was built. The hook trusts them only inside a one-sided
   tolerance and a 96% output floor; it never trusts them for more than one 0.05 ETH batch per 5 blocks.
-- The medallion contract is treated as an ERC-721. The hook reads its answers defensively and only
-  acts on a clean `ownerOf` word.
+- POOL4's owner (`0x047F606fD5b2BaA5f5C6c4aB8958E45CB6B054B7`) can close the market for good. That
+  moves this hook into fallback mode permanently; burns continue on the plain pool at 0.01 ETH per
+  batch with the re-centring anchor. In fallback the reference follows the plain pool, so the plain
+  pool's LPs are the only price source; the drift is bounded to 200 ticks per block and 1000 ticks
+  per 100 blocks beyond the band, and each burn is 0.01 ETH per 5 blocks.
+- The plain ETH/IMD pool is permissionless. A sole LP can price it up to 300 ticks (normal mode) or
+  150 ticks plus the anchor's drift (fallback) below the reference and still be used; combined with
+  the 96% floor that is at most ~3.9% below POOL4's reference per 0.05 ETH batch in normal mode.
+- The medallion contract is the Nouns token, treated as an ERC-721. The hook reads its answers
+  defensively and only acts on a clean `ownerOf` word. Retirement depends on Nouns DAO governance.
 - `CREATOR` is a fixed EOA chosen by the requester. If it is ever a contract that rejects ETH,
   `retire()` cannot complete; trading is unaffected.

@@ -25,7 +25,12 @@ import {SafeCast} from "v4-core/src/libraries/SafeCast.sol";
 /// is spent, in small permissionless batches, buying $IMD on one of two fixed ETH/IMD pools and
 /// sending it to `IMD_SINK`.
 /// @dev `CREATOR` is the requester's wallet. This is intended and disclosed: the petition that
-/// commissioned the contract is fiction written by the medallion's owner, who paid for this work.
+/// commissioned the contract is fiction written by the requester, who paid for this work.
+/// `MEDALLION_NFT` is, on Ethereum mainnet, the Nouns ERC-721 (name "Nouns", symbol "NOUN"), and
+/// Noun #447 is held by the Nouns DAO treasury timelock, not by `CREATOR`. `retire()` can therefore
+/// only succeed after a passed Nouns DAO proposal approves this hook for Noun #447 or moves the Noun
+/// to `DEAD` itself; until then the 1.64 ETH stays as claims with no other way out, and it may never
+/// be released. Fees above the cap burn $IMD regardless.
 /// The medallion, IMD and POOL4 exist on Ethereum mainnet only; on any other chain `retire()` and
 /// `burnIMD()` revert and the fee simply accumulates as claims. There is no owner, no admin, no
 /// pause, no upgrade, no setter and no sweep. Nothing here can be changed after deployment.
@@ -47,11 +52,14 @@ contract MedallionHook is IUnlockCallback {
     uint256 public constant CREATOR_SHARE_BPS = 10_000;
     /// @notice The exact amount paid to `CREATOR`, once, by `retire()`.
     uint256 public constant CREATOR_CAP = 1.64 ether;
-    /// @notice The requester's wallet, the owner of medallion #447 who paid 1.64 ETH for it.
+    /// @notice The requester's wallet. It receives the 1.64 ETH once, in `retire()`. On mainnet it does
+    /// not hold medallion #447 (see `MEDALLION_NFT`); the brief's "owner" is the petition's fiction.
     address public constant CREATOR = 0x70c6C4fcaAb11151FCEDb32eaaC3431547193A0a;
-    /// @notice The medallion collection (Ethereum mainnet only).
+    /// @notice The medallion collection, fixed by the brief. On Ethereum mainnet this address is the
+    /// Nouns ERC-721 ("Nouns" / "NOUN"); elsewhere it holds no code and `retire()` reverts.
     address public constant MEDALLION_NFT = 0x9C8fF314C9Bc7F6e59A9d9225Fb22946427eDC03;
-    /// @notice The medallion that is retired.
+    /// @notice The medallion that is retired. On mainnet Noun #447 is owned by the Nouns DAO treasury
+    /// timelock, so retirement needs a Nouns DAO proposal and may never happen.
     uint256 public constant MEDALLION_ID = 447;
     /// @notice Where the medallion and every bought $IMD go.
     address public constant DEAD = 0x000000000000000000000000000000000000dEaD;
@@ -85,6 +93,9 @@ contract MedallionHook is IUnlockCallback {
     int24 public constant ANCHOR_STEP = 200;
     /// @notice The fallback anchor never leaves `lastRef` by more than this.
     int24 public constant FALLBACK_BAND = 1000;
+    /// @notice In fallback mode `lastRef` re-centres on the anchor once this many blocks have passed
+    /// since it was last written, so the band follows a lasting move instead of stranding the burns.
+    uint256 public constant FALLBACK_RECENTER_BLOCKS = 100;
 
     /// @notice LP fee of both ETH/IMD pools.
     uint24 public constant IMD_POOL_FEE = 10_000;
@@ -134,8 +145,11 @@ contract MedallionHook is IUnlockCallback {
     int24 public anchor;
     /// @notice The anchor as it was at the start of the block in which it last moved.
     int24 public blockAnchor;
-    /// @notice The last reference tick read from POOL4; bounds the anchor to +-`FALLBACK_BAND`.
+    /// @notice Centre of the fallback band: the last POOL4 reference, or, in fallback mode, the anchor
+    /// as of the last re-centre. Bounds the anchor to +-`FALLBACK_BAND`.
     int24 public lastRef;
+    /// @notice Block in which `lastRef` was last written (seed or re-centre).
+    uint256 public lastRefBlock;
     /// @notice Block in which the anchor was last seeded or stepped.
     uint256 public anchorBlock;
 
@@ -156,6 +170,7 @@ contract MedallionHook is IUnlockCallback {
     event LastFare(uint256 indexed tokenId, bytes32 indexed hash, string fare);
     event AnchorSeeded(int24 tick, uint256 blockNumber);
     event AnchorStepped(int24 from, int24 to, int24 target, uint256 blockNumber);
+    event BandRecentered(int24 from, int24 to, uint256 blockNumber);
     event IMDBurned(
         bool indexed viaPool4, bool indexed fallbackMode, uint256 ethIn, uint256 imdOut, int24 refTick, int24 spot
     );
@@ -410,25 +425,26 @@ contract MedallionHook is IUnlockCallback {
     /// @return imdOut The $IMD sent to `IMD_SINK`.
     function burnIMD(bool viaPool4, uint256 callerMinOut) external nonReentrant returns (uint256 imdOut) {
         if (block.number < lastBurnBlock + MIN_BLOCKS_BETWEEN_BURNS) revert TooSoon();
-        (bool fallbackMode, int24 ref) = _resolveReference(viaPool4);
-        uint256 batch = _batchFor(fallbackMode);
+        // Order: TooSoon, Pool4Unavailable, batch / NothingToBurn, then the reference and the guards.
+        (bool open, int24 pool4Ref) = _pool4Reference();
+        if (!open && (viaPool4 || !anchorSeeded)) revert Pool4Unavailable();
+        uint256 batch = _batchFor(!open);
+        int24 ref = _reference(open, pool4Ref);
         uint256 minOut = quote(batch, ref) * (10_000 - MAX_SLIPPAGE_BPS) / 10_000;
         if (callerMinOut > minOut) minOut = callerMinOut;
-        imdOut = _executeBurn(viaPool4, fallbackMode, ref, batch, minOut);
+        imdOut = _executeBurn(viaPool4, !open, ref, batch, minOut);
     }
 
     /// @dev Normal mode (POOL4 answers): the reference is POOL4's tick, which also re-seeds the anchor.
-    /// Fallback mode: only the plain pool, only after POOL4 was read at least once, and the reference
-    /// is the anchor as it stood at the start of this block.
-    function _resolveReference(bool viaPool4) internal returns (bool fallbackMode, int24 ref) {
-        (bool open, int24 pool4Ref) = _pool4Reference();
+    /// Fallback mode (the caller has already passed the Pool4Unavailable check): the anchor steps once
+    /// for this block and the reference is the anchor as it stood at the start of the block.
+    function _reference(bool open, int24 pool4Ref) internal returns (int24 ref) {
         if (open) {
             _seedAnchor(pool4Ref);
-            return (false, pool4Ref);
+            return pool4Ref;
         }
-        if (viaPool4 || !anchorSeeded) revert Pool4Unavailable();
         _stepAnchor();
-        return (true, blockAnchor);
+        return blockAnchor;
     }
 
     /// @dev min(burnable, batch cap of the mode); reverts when it is not worth a swap.
@@ -555,6 +571,7 @@ contract MedallionHook is IUnlockCallback {
         anchor = ref;
         blockAnchor = ref;
         lastRef = ref;
+        lastRefBlock = block.number;
         anchorBlock = block.number;
         anchorSeeded = true;
         emit AnchorSeeded(ref, block.number);
@@ -563,10 +580,20 @@ contract MedallionHook is IUnlockCallback {
     /// @dev Fallback mode: once per block, the anchor moves at most `ANCHOR_STEP` toward the plain
     /// pool's spot tick clamped to `lastRef` +- `FALLBACK_BAND`. `blockAnchor` keeps the value the
     /// anchor had when the block started, which is the reference used by every burn in the block.
+    /// Once `FALLBACK_RECENTER_BLOCKS` blocks have passed since `lastRef` was written, the band
+    /// re-centres on the anchor before the step, so a lasting move of the plain pool beyond the band
+    /// is followed at no more than `FALLBACK_BAND` ticks per `FALLBACK_RECENTER_BLOCKS` blocks.
     function _stepAnchor() internal {
         if (anchorBlock == block.number) return;
         (uint160 sqrtPriceX96, int24 spot,,) = poolManager.getSlot0(plainKey().toId());
         if (sqrtPriceX96 == 0) revert PoolUnavailable();
+
+        if (block.number >= lastRefBlock + FALLBACK_RECENTER_BLOCKS) {
+            int24 prev = lastRef;
+            lastRef = anchor;
+            lastRefBlock = block.number;
+            emit BandRecentered(prev, anchor, block.number);
+        }
 
         int24 lo = lastRef - FALLBACK_BAND;
         int24 hi = lastRef + FALLBACK_BAND;

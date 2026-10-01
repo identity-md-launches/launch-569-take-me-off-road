@@ -116,6 +116,19 @@
   },
   {
     "type": "function",
+    "name": "FALLBACK_RECENTER_BLOCKS",
+    "inputs": [],
+    "outputs": [
+      {
+        "name": "",
+        "type": "uint256",
+        "internalType": "uint256"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
     "name": "IMD",
     "inputs": [],
     "outputs": [
@@ -826,6 +839,19 @@
   },
   {
     "type": "function",
+    "name": "lastRefBlock",
+    "inputs": [],
+    "outputs": [
+      {
+        "name": "",
+        "type": "uint256",
+        "internalType": "uint256"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
     "name": "launchPool",
     "inputs": [],
     "outputs": [
@@ -1107,6 +1133,31 @@
       },
       {
         "name": "target",
+        "type": "int24",
+        "indexed": false,
+        "internalType": "int24"
+      },
+      {
+        "name": "blockNumber",
+        "type": "uint256",
+        "indexed": false,
+        "internalType": "uint256"
+      }
+    ],
+    "anonymous": false
+  },
+  {
+    "type": "event",
+    "name": "BandRecentered",
+    "inputs": [
+      {
+        "name": "from",
+        "type": "int24",
+        "indexed": false,
+        "internalType": "int24"
+      },
+      {
+        "name": "to",
         "type": "int24",
         "indexed": false,
         "internalType": "int24"
