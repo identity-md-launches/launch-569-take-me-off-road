@@ -39,6 +39,10 @@ contract LedgerHandler is MedallionTestBase {
     uint256 public ghostRefusedSwaps;
     uint256 public ghostRefusedBurns;
     bool public ghostRetired;
+    /// @dev `lastRef` as the ghost expects it: written only when POOL4 answered (constructor, a
+    /// normal-mode burn or a poke while POOL4 is open), never by a fallback step.
+    int24 public ghostLastRef;
+    bool public ghostSeeded;
     uint256 public maxTotalFeesSeen;
     uint256 public maxBurnSpentSeen;
     uint256 public maxImdBurnedSeen;
@@ -64,6 +68,8 @@ contract LedgerHandler is MedallionTestBase {
         vm.prank(nftOwner);
         nft.setApprovalForAll(address(hook), true);
         ghostLastBurnBlock = block.number;
+        ghostLastRef = hook.lastRef();
+        ghostSeeded = hook.anchorSeeded();
     }
 
     // ------------------------------------------------------------------------------------------
@@ -92,7 +98,9 @@ contract LedgerHandler is MedallionTestBase {
             }),
             PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}),
             ""
-        ) returns (BalanceDelta d) {
+        ) returns (
+            BalanceDelta d
+        ) {
             uint256 gross = poolGrossEth();
             uint256 fee = (shape == 0 || shape == 1) ? amount * 200 / 10_000 : gross * 200 / 10_000;
             ghostFees += fee;
@@ -153,7 +161,8 @@ contract LedgerHandler is MedallionTestBase {
     function burn(uint8 who, bool viaPool4, uint8 blocks) external {
         vm.roll(block.number + bound(blocks, 0, 8));
         address keeper = keepers[bound(who, 0, keepers.length - 1)];
-        (bool open,) = hook.pool4Reference();
+        (bool open, int24 ref) = hook.pool4Reference();
+        int24 lastRefBefore = hook.lastRef();
         uint256 burnableBefore = hook.burnable();
         uint256 spentBefore = hook.burnSpent();
         uint256 imdBefore = hook.imdBurned();
@@ -174,6 +183,13 @@ contract LedgerHandler is MedallionTestBase {
             assertEq(keeper.balance, 0);
             assertEq(imdBalance(keeper), 0);
             if (!open) assertFalse(viaPool4, "fallback mode never uses POOL4");
+            if (open) {
+                assertEq(hook.lastRef(), ref, "a normal-mode burn re-seeds lastRef from POOL4");
+                ghostLastRef = ref;
+                ghostSeeded = true;
+            } else {
+                assertEq(hook.lastRef(), lastRefBefore, "a fallback burn never writes lastRef");
+            }
             ghostBurnSpent += batch;
             ghostImdOut += out;
             ghostBurns++;
@@ -185,6 +201,7 @@ contract LedgerHandler is MedallionTestBase {
             assertEq(hook.imdBurned(), imdBefore);
             assertEq(hookClaims(), claimsBefore);
             assertEq(hook.anchorBlock(), anchorBlockBefore, "a refused burn does not move the anchor");
+            assertEq(hook.lastRef(), lastRefBefore, "a refused burn does not touch lastRef");
         }
         _snapshot();
     }
@@ -192,6 +209,7 @@ contract LedgerHandler is MedallionTestBase {
     function poke(uint8 blocks) external {
         vm.roll(block.number + bound(blocks, 0, 3));
         int24 anchorBefore = hook.anchor();
+        int24 lastRefBefore = hook.lastRef();
         uint256 anchorBlockBefore = hook.anchorBlock();
         (bool open, int24 ref) = hook.pool4Reference();
         try hook.pokeAnchor() {
@@ -199,18 +217,23 @@ contract LedgerHandler is MedallionTestBase {
                 assertEq(hook.anchor(), ref);
                 assertEq(hook.lastRef(), ref);
                 assertEq(hook.blockAnchor(), ref);
+                ghostLastRef = ref;
+                ghostSeeded = true;
             } else if (anchorBlockBefore == block.number) {
                 assertEq(hook.anchor(), anchorBefore, "one step per block");
+                assertEq(hook.lastRef(), lastRefBefore, "a fallback poke never writes lastRef");
             } else {
                 int24 moved = hook.anchor() - anchorBefore;
                 assertLe(moved, hook.ANCHOR_STEP());
                 assertGe(moved, -hook.ANCHOR_STEP());
                 assertEq(hook.blockAnchor(), anchorBefore, "blockAnchor is the value before the step");
+                assertEq(hook.lastRef(), lastRefBefore, "a fallback step never writes lastRef");
             }
         } catch (bytes memory reason) {
             assertEq(bytes4(reason), MedallionHook.Pool4Unavailable.selector);
             assertFalse(open);
             assertFalse(hook.anchorSeeded());
+            assertEq(hook.lastRef(), lastRefBefore);
         }
         _snapshot();
     }
@@ -368,7 +391,13 @@ contract MedallionLedgerInvariantTest is Test {
         assertLe(anchor - hook.blockAnchor(), hook.ANCHOR_STEP());
         assertGe(anchor - hook.blockAnchor(), -hook.ANCHOR_STEP());
         assertLe(hook.anchorBlock(), block.number);
-        assertLe(hook.lastRefBlock(), hook.anchorBlock());
+    }
+
+    /// @dev The band's centre is only ever a reference POOL4 supplied: no fallback step, poke or burn
+    /// moves `lastRef`, and once seeded the hook never forgets it.
+    function invariant_lastRefIsWrittenOnlyByAPool4Seed() public view {
+        assertEq(hook.anchorSeeded(), handler.ghostSeeded());
+        assertEq(hook.lastRef(), handler.ghostLastRef());
     }
 
     function invariant_fareSupplyIsFixedAndAccountedFor() public view {
