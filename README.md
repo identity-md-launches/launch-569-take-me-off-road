@@ -95,11 +95,14 @@ initialized) and the guards run.
 - *Fallback mode*: only the plain pool. The reference is the anchor as it stood at the start of the
   block. The anchor then steps at most `ANCHOR_STEP = 200` ticks toward the plain pool's spot, clamped
   to `lastRef ± FALLBACK_BAND (1000)`, once per block however long it idled. `pokeAnchor()` does the
-  same step without burning, and re-seeds from POOL4 while it answers. Once
-  `FALLBACK_RECENTER_BLOCKS = 100` blocks have passed since `lastRef` was written, the next step first
-  re-centres `lastRef` on the anchor (`BandRecentered`), so a lasting move of the plain pool beyond the
-  band is followed at no more than 1000 ticks per 100 blocks instead of stranding the burns for good.
-  A re-seed from POOL4 resets that clock.
+  same step without burning, and re-seeds from POOL4 while it answers. `lastRef` is written only by a
+  seed from POOL4, never in fallback mode, so the band is fixed while POOL4 is silent. **Liveness
+  limit:** a plain-pool move that stays more than `FALLBACK_BAND + MAX_REF_DEVIATION = 1150` ticks
+  below `lastRef` (IMD about 12% dearer in ETH) pins the anchor at `lastRef - 1000` and every fallback
+  burn reverts `PriceOffReference` until POOL4 supplies a new reference. After a terminal POOL4 close
+  that can be permanent; the fees then stay as claims. A move the other way pins the anchor at
+  `lastRef + 1000`, burns go through, and the 96% floor is measured at the band edge rather than at the
+  market.
 - *One-sided guard*: `PriceOffReference` only when `spot < reference - tolerance`; tolerance is
   `MAX_PLAIN_DEVIATION = 300` for the plain pool in normal mode, `MAX_REF_DEVIATION = 150` otherwise.
   A pool where $IMD is cheaper than the reference is never refused.
@@ -139,7 +142,6 @@ transfer, no ETH to `CREATOR` except the one cap in `retire()`, no caller-chosen
 | `MAX_REF_DEVIATION` / `MAX_PLAIN_DEVIATION` | 150 / 300 ticks |
 | `MAX_SLIPPAGE_BPS` | 400 |
 | `ANCHOR_STEP` / `FALLBACK_BAND` | 200 / 1000 ticks |
-| `FALLBACK_RECENTER_BLOCKS` | 100 blocks |
 
 ## Interface
 
@@ -147,11 +149,10 @@ Hook callbacks (PoolManager only): `afterInitialize`, `beforeSwap`, `afterSwap`,
 Permissionless: `retire()`, `burnIMD(bool viaPool4, uint256 callerMinOut)`, `pokeAnchor()`.
 Views: `status()`, `totalFees()`, `creatorPaid()`, `burnSpent()`, `imdBurned()`, `retired()`,
 `creatorEntitlement()`, `burnable()`, `reservedClaims()`, `launchPool()`, `launchPoolSet()`,
-`lastBurnBlock()`, `anchorSeeded()`, `anchor()`, `blockAnchor()`, `lastRef()`, `lastRefBlock()`,
-`anchorBlock()`, `pool4Key()`, `plainKey()`, `quote(amount, tick)`, `pool4Reference()`,
-`getHookPermissions()`.
+`lastBurnBlock()`, `anchorSeeded()`, `anchor()`, `blockAnchor()`, `lastRef()`, `anchorBlock()`,
+`pool4Key()`, `plainKey()`, `quote(amount, tick)`, `pool4Reference()`, `getHookPermissions()`.
 Events: `LaunchPoolSet`, `FeeCollected`, `Recouped`, `MedallionRetired`, `CreatorPaid`, `LastFare`,
-`AnchorSeeded`, `AnchorStepped`, `BandRecentered`, `IMDBurned`. ABIs: `docs/abi/MedallionHook.json`,
+`AnchorSeeded`, `AnchorStepped`, `IMDBurned`. ABIs: `docs/abi/MedallionHook.json`,
 `docs/abi/FareToken.json`.
 
 ## Build and test (offline)
@@ -165,7 +166,7 @@ forge test --offline
 forge fmt --check
 ```
 
-The suite has 96 unit and fuzz tests plus 4 invariants (see `test/`). Tests deploy their own
+The suite has 92 unit and fuzz tests plus 4 invariants (see `test/`). Tests deploy their own
 PoolManager, mine a CREATE2 salt for the 0x10CC flags, and `vm.etch` mocks at the mainnet addresses of
 the medallion, $IMD and the POOL4 hook. No environment variables, no ffi, no filesystem access.
 
@@ -201,8 +202,10 @@ the medallion, $IMD and the POOL4 hook. No environment variables, no ffi, no fil
   written (open, tick 60396). The live POOL4 hook has an owner-only, terminal `closeMarket()`; if it is
   ever used, this hook is in fallback mode for life: burns continue on the plain pool at 0.01 ETH per
   batch with the anchored reference, which follows the plain pool at 200 ticks per block inside a
-  ±1000 band that re-centres every 100 blocks. Burns never depend on POOL4 reopening, but they do
-  need POOL4 to have answered at least once (at deployment or later).
+  fixed ±1000 band around the last POOL4 reference. The band never moves without POOL4, so if the
+  plain pool settles more than 1150 ticks below that reference the burns stop for good and the fees
+  stay as claims (see "Liveness limit" above). Burns also need POOL4 to have answered at least once
+  (at deployment or later).
 - **The plain pool is permissionless.** Anyone can create and solely supply `(ETH, IMD, 10000, 200,
   no hook)`. Inside the brief's fixed tolerances such an LP can sell $IMD to the hook at up to about
   3.9% below POOL4's reference per 0.05 ETH batch in normal mode (300 ticks of deviation plus the 96%

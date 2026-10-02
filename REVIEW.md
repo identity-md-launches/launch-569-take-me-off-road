@@ -9,16 +9,16 @@ separate adversarial review is still required before funds depend on this code.
 
 ```
 forge build --offline      Compiler run successful (solc 0.8.26, cancun, optimizer 200, via_ir off)
-forge test  --offline      96 passed, 0 failed, 0 skipped + 4 invariants (32 runs x 24 depth)
+forge test  --offline      96 passed, 0 failed, 0 skipped (92 unit/fuzz + 4 invariants, 32 runs x 24 depth)
 forge fmt   --check        clean
 ```
 
-Bytecode walk (PUSH data skipped) over both runtimes: no 0xF2, 0xF4, 0xFF. Hook runtime about 14.6
-KB, under the EIP-170 limit. Token constructor mints exactly 1e27 to `msg.sender`.
+Bytecode walk (PUSH data skipped) over both runtimes: no 0xF2, 0xF4, 0xFF. Hook runtime under the
+EIP-170 limit. Token constructor mints exactly 1e27 to `msg.sender`.
 
-The reviewer's proof for the fallback-band finding (`Proof_cbfaa27a5c9e.t.sol`, copied under
-`test/scratch/`) failed on the starting tree with `PriceOffReference(-1229, -1000)` and passes on this
-one.
+The reviewer's proof for the band-drift finding (`Proof_35bdb332a451.t.sol`, copied under
+`test/scratch/`) failed on the starting tree with `anchor left lastRef - FALLBACK_BAND: -1200 < -1000`
+and passes on this one.
 
 `launch.json` fields checked against the shape the manifest check expects: `hook.contract` and
 `token.contract` are contract names, `hook.permissions` is an array of the five flag names,
@@ -47,14 +47,21 @@ characters. This was the fault of the rejected attempt and is the first thing ve
 | # | Severity | Finding | Disposition |
 | --- | --- | --- | --- |
 | 13 | High | `MEDALLION_NFT` is the mainnet Nouns token; Noun #447 sits in the Nouns DAO treasury timelock, so `retire()` needs a DAO vote and the 1.64 ETH may never be released. Reproduced with `cast call` against mainnet (name "Nouns", symbol "NOUN", `ownerOf(447)` = `0xb1a3…ef71`, `delay()` 172800, CREATOR balance 0, `getApproved(447)` zero). | The constant is the brief's and stays. Disclosure corrected everywhere it was wrong: NatSpec on `CREATOR`, `MEDALLION_NFT`, `MEDALLION_ID` and the contract header; README Disclosure, Deployment parameters and Operational responsibilities; OPERATIONS "When the cap is reached" and Trust assumptions; `launch.json` notes. All now say retirement depends on a passed Nouns DAO proposal and may never happen, and that the 1.64 ETH has no other exit. |
-| 14 | Medium | Fallback anchor clamped to a `lastRef` band that was never refreshed after a terminal POOL4 close: a lasting plain-pool move of > 1150 ticks stranded every post-cap fee; the mirror move left the floor far below market. Reproduced with the reviewer's proof. | `FALLBACK_RECENTER_BLOCKS = 100`: in fallback, once 100 blocks have passed since `lastRef` was written, the next anchor step re-centres `lastRef` on the anchor (`BandRecentered`, `lastRefBlock`). The band now follows a lasting move at ≤ 1000 ticks per 100 blocks; a re-seed from POOL4 resets the clock. Tests: `test_bandRecentersAfterRecenterBlocksAndBurnsFollowALastingMoveDown`, `…MoveUpAndTheFloorFollows`, `test_bandDoesNotRecenterBeforeRecenterBlocks`, `test_recenterBoundsTheDriftOfTheReference`, `test_reseedFromPool4ResetsTheRecenterClock`; the proof passes. |
+| 14 | Medium | Fallback anchor clamped to a `lastRef` band that was never refreshed after a terminal POOL4 close: a lasting plain-pool move of > 1150 ticks stranded every post-cap fee; the mirror move left the floor far below market. Reproduced with the reviewer's proof. | First answered with `FALLBACK_RECENTER_BLOCKS = 100` (lastRef re-centred on the anchor every 100 blocks). That change was itself reopened as finding 19 and reverted: the band is the specification's, and widening it is a specification change. The liveness limit is now disclosed instead of fixed; see 19. |
 | 15 | Low | In fallback mode the plain pool was read (and the anchor stepped) before `batch` / `NothingToBurn`, so a keeper with nothing burnable saw `PoolUnavailable`. Reproduced on the fixture. | `burnIMD` now decides the mode first, computes the batch, and only then seeds or steps the anchor and reads the spot, matching the SPEC 7 order. `_resolveReference` became `_reference(open, pool4Ref)`. Tests: `test_fallbackNothingToBurnComesBeforeThePlainPoolRead`, `test_pool4UnavailableComesBeforeNothingToBurn`. |
 | 16 | Info | `launchPool` is the first native-ETH pool; the economics rely on the factory deploying and initializing atomically. | By SPEC 2, no code change. The dependency is now stated in README Deployment parameters as well as OPERATIONS step 2. |
 | 17 | Info | A sole LP of the permissionless plain pool can sell IMD to the hook up to ~3.9% below POOL4's reference per 0.05 ETH batch inside the brief's tolerances. | Inside SPEC 3's constants, no code change. Documented as a bound in README Operational responsibilities and OPERATIONS Trust assumptions. |
 | 18 | Low (test) | `MedallionInvariantTest` targeted the whole handler, so the fuzzer could call the handler's public `setUp()` mid-sequence, redeploy the hook, and fail `invariant_creatorPaidIsZeroOrCap` against a stale hook (seen once with seed `0xb32b…5e0`). Found while re-running the suite. | `targetSelector` now lists the five actions. |
 
+### Second revision round (independent review, 2026-10-02)
+
+| # | Severity | Finding | Disposition |
+| --- | --- | --- | --- |
+| 19 | Medium | The re-centre added for finding 14 rewrote `lastRef` from the plain-pool-derived anchor every 100 blocks, so permissionless `pokeAnchor()` calls during a POOL4 outage moved both the guard reference and the 96% floor beyond SPEC 7's fixed `lastRef ± 1000` band with no new POOL4 observation. Reproduced with the reviewer's proof (anchor −1200 at the 100th block, lastRef −1000; burn accepted at refTick −2246 after 250 blocks). | Reverted. `FALLBACK_RECENTER_BLOCKS`, `lastRefBlock` and `BandRecentered` removed; `_stepAnchor` no longer writes `lastRef`, which is written only by `_seedAnchor` from a POOL4 reference. The old perpetual-burn claim was not reinstated: the liveness limit (a plain-pool move that stays > 1150 ticks below `lastRef` leaves burns refused until POOL4 answers, possibly forever after a terminal close, with the fees left as claims) is stated in NatSpec, README, DESIGN, OPERATIONS and the launch notes. Tests: `test_fallbackBandIsFixedUntilPool4AnswersAgain`, `test_fallbackBandIsFixedOnALastingMoveUp`, `test_fallbackRevertLeavesTheBandUntouched`, `test_reseedFromPool4IsTheOnlyWriteToLastRef`; ABI regenerated; the proof passes. |
+
 No open findings. Items 3, 4, 5 are design decisions that the tests pin; item 13 is a disclosed
-dependency on Nouns DAO governance that the requester must pursue.
+dependency on Nouns DAO governance that the requester must pursue; item 19 leaves a disclosed liveness
+limit in fallback mode that only a specification change could remove.
 
 ## Checklist (uniswap-v4-security / ethskills)
 
@@ -82,4 +89,7 @@ dependency on Nouns DAO governance that the requester must pursue.
 - Retirement needs a passed Nouns DAO proposal (approve the hook for Noun #447, or move it to DEAD).
   Nobody involved in this launch can do that alone; without it the 1.64 ETH stays locked.
 - Keepers for `burnIMD` / `pokeAnchor`; nobody is paid to call them. In fallback mode they also keep
-  the anchor following the plain pool.
+  the anchor following the plain pool inside the fixed band.
+- If POOL4 is closed for good and the plain pool settles more than 1150 ticks below the last POOL4
+  reference, the burns stop and the post-cap fees stay as claims. Only a specification change (a
+  different band rule) could alter that; the requester should decide whether to ask for one.

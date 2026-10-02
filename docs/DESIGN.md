@@ -69,7 +69,7 @@ TooSoon            if block.number < lastBurnBlock + 5
 open, ref = POOL4.marketOpen(), POOL4.refTick()      (staticcalls, length == 32, flag == 1, tick in range)
 Pool4Unavailable   if !open and (viaPool4 or !anchorSeeded)
 batch = min(burnable, open ? 0.05 : 0.01 ETH); NothingToBurn if batch < 0.002 ETH
-normal   (open):   seed anchor = blockAnchor = lastRef = ref, lastRefBlock = block; reference = ref
+normal   (open):   seed anchor = blockAnchor = lastRef = ref; reference = ref
 fallback (!open):  stepAnchor(); reference = blockAnchor
 key   = viaPool4 ? POOL4 : plain
 spot  = slot0(key).tick;  PoolUnavailable if the pool is not initialized
@@ -87,16 +87,14 @@ imdBurned += out; emit IMDBurned
 ### The anchor
 
 `anchor` is the fallback reference. `blockAnchor` is the value `anchor` had when the block in which it
-last moved began. `anchorBlock` is that block. `lastRef` is the centre of the band: the last POOL4
-reference, or the anchor as of the last re-centre. `lastRefBlock` is the block `lastRef` was written.
+last moved began. `anchorBlock` is that block. `lastRef` is the centre of the band: the last reference
+POOL4 supplied. It is written only by `seedAnchor()`; fallback mode never touches it.
 
 `stepAnchor()` runs at most once per block:
 
 ```
 if anchorBlock == block.number: return
 plainSpot   = slot0(plain).tick                      (PoolUnavailable if not initialized)
-if block.number >= lastRefBlock + 100:               (FALLBACK_RECENTER_BLOCKS)
-    lastRef = anchor; lastRefBlock = block.number    emit BandRecentered
 target      = clamp(plainSpot, lastRef - 1000, lastRef + 1000)
 blockAnchor = anchor
 anchor     += clamp(target - anchor, -200, +200)
@@ -109,18 +107,25 @@ block, and never leaves `lastRef ± 1000`. An attacker who pushes the plain pool
 anchor to walk down 200 ticks per block before a burn at the depressed price passes the guard, and
 each such burn is at most 0.01 ETH every 5 blocks.
 
-### Why the band re-centres
+### Why the band is fixed, and what that costs
 
-Without the re-centre, `lastRef` was written only while POOL4 answered. The live POOL4 hook has an
-owner-only, terminal `closeMarket()`. After such a close the hook is in fallback mode for life, and a
-lasting plain-pool move of more than 1150 ticks below `lastRef` (IMD ~12% dearer in ETH) pinned the
-anchor at `lastRef - 1000` and made every burn revert `PriceOffReference` forever, stranding every
-post-cap fee; a move the other way pinned the anchor at `lastRef + 1000` and left the 96% floor far
-below the market. Re-centring every 100 blocks (~20 minutes on mainnet) lets the band slide to the
-anchor, so the reference follows a lasting move at no more than 1000 ticks per 100 blocks, while a
-short manipulation still has to be held across 200-tick steps and a re-centre to move the reference
-far. Within 100 blocks the hook burns at most 20 × 0.01 ETH, which bounds what a sustained false price
-can cost per re-centre interval. A re-seed from POOL4 resets `lastRef`, `anchor` and the clock.
+SPEC 7 fixes the band at `lastRef ± FALLBACK_BAND` with `lastRef` the last POOL4 reference. A previous
+revision re-centred `lastRef` on the anchor every 100 blocks so that burns could follow a lasting
+plain-pool move after a terminal POOL4 close; an independent review showed that this let
+permissionless `pokeAnchor()` calls walk both the guard reference and the 96% floor out of the
+specified band with no new POOL4 observation, so it was removed. `lastRef` is now written only by a
+seed from POOL4 (constructor, normal-mode burn, `pokeAnchor()` while POOL4 answers).
+
+The price of the fixed band is liveness. The live POOL4 hook has an owner-only, terminal
+`closeMarket()`. After such a close the hook is in fallback mode for life, and a plain-pool move that
+stays more than 1150 ticks below `lastRef` (IMD ~12% dearer in ETH) pins the anchor at
+`lastRef - 1000` and makes every burn revert `PriceOffReference` until POOL4 answers again, which
+after a terminal close is never. The post-cap fees then remain as claims on the PoolManager; nothing
+can release them. A move the other way pins the anchor at `lastRef + 1000`; burns go through and the
+96% floor is measured at the band edge, so the floor is looser than the market but still bounded by
+the last POOL4 price. Both limits are tested (`test_fallbackBandIsFixedUntilPool4AnswersAgain`,
+`test_fallbackBandIsFixedOnALastingMoveUp`) and disclosed in the README, OPERATIONS and the launch
+notes. Changing this needs a change to the specification, not to the code.
 
 ### Why the guard is one-sided
 

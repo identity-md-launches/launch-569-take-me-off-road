@@ -49,12 +49,12 @@
   manager.
 - If POOL4 stops answering (`pool4Reference()` returns `open = false`): only `burnIMD(false, …)`
   works, with the anchored reference. Call `pokeAnchor()` once per block to let the anchor follow the
-  plain pool (≤ 200 ticks per block, within ±1000 of `lastRef`). Every 100 blocks since `lastRef` was
-  last written, the next step re-centres `lastRef` on the anchor (`BandRecentered`), so after a
-  lasting move of the plain pool beyond the band the anchor catches up at ≤ 1000 ticks per 100 blocks
-  and burns resume; a keeper only has to keep poking. The live POOL4 hook's `closeMarket()` is
-  terminal, so this fallback may be permanent. If POOL4 never answered since deployment, burns are
-  impossible until it does.
+  plain pool (≤ 200 ticks per block, within ±1000 of `lastRef`). `lastRef` is the last reference POOL4
+  gave and does not move without POOL4. If the plain pool settles more than 1150 ticks below it,
+  `burnIMD(false, …)` reverts `PriceOffReference(spot, lastRef - 1000)` and keeps doing so until POOL4
+  answers again; poking does not help. The live POOL4 hook's `closeMarket()` is terminal, so this
+  fallback may be permanent and the burns may stop for good, with the fees left as claims. If POOL4
+  never answered since deployment, burns are impossible until it does.
 - The caller is not paid. Gas is a donation.
 
 ## Sepolia and other chains
@@ -68,7 +68,7 @@ Fees still accrue and `status()` still works. Nothing on those chains can releas
 - `Recouped(totalFees, block)` once.
 - `MedallionRetired(from)`, `CreatorPaid(creator, 1.64e18)`, `LastFare(447, hash, text)` on retirement.
 - `IMDBurned(viaPool4, fallbackMode, ethIn, imdOut, refTick, spot)` per burn;
-  `AnchorSeeded` / `AnchorStepped` / `BandRecentered` as the reference moves.
+  `AnchorSeeded` / `AnchorStepped` as the reference moves.
 - Invariant to alert on: `PoolManager.balanceOf(hook, 0) >= totalFees - creatorPaid - burnSpent`.
 
 ## Trust assumptions
@@ -78,9 +78,11 @@ Fees still accrue and `status()` still works. Nothing on those chains can releas
   tolerance and a 96% output floor; it never trusts them for more than one 0.05 ETH batch per 5 blocks.
 - POOL4's owner (`0x047F606fD5b2BaA5f5C6c4aB8958E45CB6B054B7`) can close the market for good. That
   moves this hook into fallback mode permanently; burns continue on the plain pool at 0.01 ETH per
-  batch with the re-centring anchor. In fallback the reference follows the plain pool, so the plain
-  pool's LPs are the only price source; the drift is bounded to 200 ticks per block and 1000 ticks
-  per 100 blocks beyond the band, and each burn is 0.01 ETH per 5 blocks.
+  batch with the anchored reference inside a fixed ±1000 band around the last POOL4 reference. In
+  fallback the plain pool's LPs are the only price source, but they can move the reference by at most
+  200 ticks per block and never beyond the band; each burn is 0.01 ETH per 5 blocks. The flip side is
+  that a lasting move of the plain pool more than 1150 ticks below the last POOL4 reference stops the
+  burns for as long as POOL4 stays closed, possibly forever.
 - The plain ETH/IMD pool is permissionless. A sole LP can price it up to 300 ticks (normal mode) or
   150 ticks plus the anchor's drift (fallback) below the reference and still be used; combined with
   the 96% floor that is at most ~3.9% below POOL4's reference per 0.05 ETH batch in normal mode.

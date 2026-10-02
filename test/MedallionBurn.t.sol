@@ -14,7 +14,6 @@ contract MedallionBurnTest is MedallionTestBase {
     );
     event AnchorSeeded(int24 tick, uint256 blockNumber);
     event AnchorStepped(int24 from, int24 to, int24 target, uint256 blockNumber);
-    event BandRecentered(int24 from, int24 to, uint256 blockNumber);
 
     uint256 internal constant IMD_LIQUIDITY = 500 ether;
 
@@ -311,7 +310,6 @@ contract MedallionBurnTest is MedallionTestBase {
         assertEq(fresh.anchor(), 60396);
         assertEq(fresh.blockAnchor(), 60396);
         assertEq(fresh.lastRef(), 60396);
-        assertEq(fresh.lastRefBlock(), block.number);
         assertEq(fresh.anchorBlock(), block.number);
 
         pool4Mock.setMarketOpen(false);
@@ -413,51 +411,46 @@ contract MedallionBurnTest is MedallionTestBase {
     }
 
     // ------------------------------------------------------------------------------------------
-    // Fallback band re-centring
+    // The fallback band is fixed: lastRef is only ever written from POOL4
     // ------------------------------------------------------------------------------------------
 
-    /// @dev A lasting plain-pool move of more than FALLBACK_BAND + MAX_REF_DEVIATION below lastRef
-    /// must not strand the burns for good: after FALLBACK_RECENTER_BLOCKS the band re-centres on the
-    /// anchor and the anchor keeps following the pool.
-    function test_bandRecentersAfterRecenterBlocksAndBurnsFollowALastingMoveDown() public {
+    /// @dev SPEC 7: in fallback mode the anchor is clamped to lastRef +- FALLBACK_BAND and lastRef is
+    /// the last reference POOL4 supplied. A lasting plain-pool move beyond the band is therefore not
+    /// followed, however many blocks pass and however often pokeAnchor() is called: the burns stay
+    /// refused until POOL4 answers again. This is the disclosed liveness limit of fallback mode.
+    function test_fallbackBandIsFixedUntilPool4AnswersAgain() public {
         readyToBurn();
         hook.pokeAnchor(); // lastRef = anchor = 0
-        uint256 seedBlock = block.number;
         pool4Mock.setMarketOpen(false); // terminal on the live hook
         pushPlainSpot(false, 32 ether); // IMD ~12% dearer and it stays there
         int24 spot = currentTick(plainKey);
         assertLt(spot, -1150);
         assertGt(spot, -2000);
 
-        // Up to the re-centre block the anchor is pinned at lastRef - 1000 and burns are refused.
-        for (uint256 i = 1; i < 100; i++) {
-            vm.roll(seedBlock + i);
+        int24 lo = -hook.FALLBACK_BAND();
+        for (uint256 i = 1; i <= 250; i++) {
+            vm.roll(block.number + 1);
             hook.pokeAnchor();
+            assertGe(hook.anchor(), lo, "anchor left lastRef - FALLBACK_BAND");
+            assertEq(hook.lastRef(), 0, "lastRef rewritten without a POOL4 reference");
         }
         assertEq(hook.anchor(), -1000, "pinned at the band edge");
-        assertEq(hook.lastRef(), 0, "no re-centre yet");
-        assertEq(hook.lastRefBlock(), seedBlock);
-        vm.roll(seedBlock + 99 + 1);
-        // This block re-centres and steps: the burn in it still uses the start-of-block anchor (-1000).
-        vm.expectEmit(false, false, false, true, address(hook));
-        emit BandRecentered(0, -1000, block.number);
-        vm.expectEmit(false, false, false, true, address(hook));
-        emit AnchorStepped(-1000, -1200, spot, block.number);
-        vm.expectRevert(abi.encodeWithSelector(MedallionHook.PriceOffReference.selector, spot, int24(-1000)));
-        hook.burnIMD(false, 0);
-        assertEq(hook.lastRef(), 0, "a revert undoes the re-centre");
-
-        hook.pokeAnchor();
-        assertEq(hook.lastRef(), -1000, "band re-centred on the anchor");
-        assertEq(hook.lastRefBlock(), block.number);
-        assertEq(hook.anchor(), -1200, "and the anchor stepped past the old edge");
         assertEq(hook.blockAnchor(), -1000);
 
-        vm.roll(block.number + 1);
-        hook.pokeAnchor();
-        assertEq(hook.anchor(), spot, "the anchor reached the pool");
+        // The plain pool sits more than 150 ticks below the pinned reference: refused, for good.
+        vm.roll(block.number + 5);
+        vm.expectRevert(abi.encodeWithSelector(MedallionHook.PriceOffReference.selector, spot, int24(-1000)));
+        hook.burnIMD(false, 0);
+        assertEq(hook.burnSpent(), 0, "nothing burned while the pool is outside the band");
 
-        vm.roll(block.number + 10);
+        // Only a new POOL4 reference moves the band.
+        pool4Mock.setMarketOpen(true);
+        pool4Mock.setRefTick(spot);
+        hook.pokeAnchor();
+        assertEq(hook.lastRef(), spot, "lastRef follows POOL4");
+        assertEq(hook.anchor(), spot);
+        pool4Mock.setMarketOpen(false);
+        vm.roll(block.number + 1);
         vm.recordLogs();
         uint256 out = hook.burnIMD(false, 0);
         BurnLog memory log_ = lastBurnLog();
@@ -465,12 +458,11 @@ contract MedallionBurnTest is MedallionTestBase {
         assertEq(log_.refTick, spot);
         assertGt(out, 0);
         assertGe(out, hook.quote(0.01 ether, spot) * 96 / 100);
-        assertEq(hook.burnSpent(), 0.01 ether);
     }
 
-    /// @dev Mirror case: a lasting move up pins the anchor at lastRef + 1000 and leaves the floor far
-    /// below the market. After the re-centre the anchor follows and the floor tightens.
-    function test_bandRecentersAfterALastingMoveUpAndTheFloorFollows() public {
+    /// @dev Mirror case: a lasting move up pins the anchor at lastRef + 1000. The one-sided guard
+    /// still lets the burn through, with the 96% floor measured at the band edge, not at the market.
+    function test_fallbackBandIsFixedOnALastingMoveUp() public {
         readyToBurn();
         hook.pokeAnchor();
         pool4Mock.setMarketOpen(false);
@@ -478,70 +470,48 @@ contract MedallionBurnTest is MedallionTestBase {
         int24 spot = currentTick(plainKey);
         assertGt(spot, 1200);
 
-        for (uint256 i = 0; i < 10; i++) {
+        for (uint256 i = 0; i < 120; i++) {
             vm.roll(block.number + 1);
             hook.pokeAnchor();
+            assertLe(hook.anchor(), 1000, "anchor left lastRef + FALLBACK_BAND");
+            assertEq(hook.lastRef(), 0, "lastRef rewritten without a POOL4 reference");
         }
         assertEq(hook.anchor(), 1000, "pinned at the upper edge");
-        uint256 looseFloor = hook.quote(0.01 ether, 1000) * 96 / 100;
+        assertEq(hook.blockAnchor(), 1000);
 
-        vm.roll(hook.lastRefBlock() + hook.FALLBACK_RECENTER_BLOCKS());
+        vm.roll(block.number + 5);
+        vm.recordLogs();
+        uint256 out = hook.burnIMD(false, 0);
+        BurnLog memory log_ = lastBurnLog();
+        assertEq(log_.refTick, 1000, "reference is the band edge");
+        assertGe(out, hook.quote(0.01 ether, 1000) * 96 / 100);
+        assertGe(out, hook.quote(0.01 ether, spot) * 96 / 100, "the market pays more than the floor");
+    }
+
+    /// @dev A burn that reverts in fallback mode leaves the anchor and lastRef untouched; pokeAnchor
+    /// after it steps the anchor but never lastRef.
+    function test_fallbackRevertLeavesTheBandUntouched() public {
+        readyToBurn();
         hook.pokeAnchor();
-        assertEq(hook.lastRef(), 1000);
-        assertGt(hook.anchor(), 1000, "follows the pool again");
-        while (hook.anchor() != spot) {
+        pool4Mock.setMarketOpen(false);
+        pushPlainSpot(false, 32 ether);
+        int24 spot = currentTick(plainKey);
+        for (uint256 i = 0; i < 6; i++) {
             vm.roll(block.number + 1);
             hook.pokeAnchor();
         }
-        vm.roll(block.number + 1);
-        hook.pokeAnchor(); // blockAnchor = spot
-        assertEq(hook.blockAnchor(), spot);
-        uint256 tightFloor = hook.quote(0.01 ether, spot) * 96 / 100;
-        assertGt(tightFloor, looseFloor, "the output floor tracks the market");
-
-        vm.roll(block.number + 5);
-        uint256 out = hook.burnIMD(false, 0);
-        assertGe(out, tightFloor);
-    }
-
-    function test_bandDoesNotRecenterBeforeRecenterBlocks() public {
-        readyToBurn();
-        hook.pokeAnchor();
-        uint256 seedBlock = block.number;
-        pool4Mock.setMarketOpen(false);
-        pushPlainSpot(false, 32 ether);
-        vm.roll(seedBlock + hook.FALLBACK_RECENTER_BLOCKS() - 1);
+        assertEq(hook.anchor(), -1000);
+        vm.roll(block.number + 100);
+        vm.expectRevert(abi.encodeWithSelector(MedallionHook.PriceOffReference.selector, spot, int24(-1000)));
+        hook.burnIMD(false, 0);
+        assertEq(hook.lastRef(), 0);
+        assertEq(hook.anchor(), -1000);
         hook.pokeAnchor();
         assertEq(hook.lastRef(), 0);
-        assertEq(hook.lastRefBlock(), seedBlock);
-        vm.roll(seedBlock + hook.FALLBACK_RECENTER_BLOCKS());
-        hook.pokeAnchor();
-        assertEq(hook.lastRefBlock(), block.number, "re-centred exactly at the boundary");
+        assertEq(hook.anchor(), -1000);
     }
 
-    /// @dev The band can drift at most FALLBACK_BAND per FALLBACK_RECENTER_BLOCKS: an attacker who
-    /// holds the plain pool at a false price cannot move the reference faster than that.
-    function test_recenterBoundsTheDriftOfTheReference() public {
-        readyToBurn();
-        hook.pokeAnchor();
-        uint256 seedBlock = block.number;
-        pool4Mock.setMarketOpen(false);
-        pushPlainSpot(false, 2000 ether); // very far below
-        int24 spot = currentTick(plainKey);
-        assertLt(spot, -5000);
-        uint256 n = hook.FALLBACK_RECENTER_BLOCKS();
-        // Every block for 2n blocks: the anchor can be at most -1000 (first band) - 1000 (one
-        // re-centre) - 1000 (second re-centre at 2n) = -3000 after the step in block 2n.
-        for (uint256 i = 1; i <= 2 * n; i++) {
-            vm.roll(seedBlock + i);
-            hook.pokeAnchor();
-        }
-        assertEq(hook.lastRef(), -2000);
-        assertEq(hook.anchor(), -2200, "one step past the re-centred edge in the re-centre block");
-        assertGe(hook.anchor(), -3000);
-    }
-
-    function test_reseedFromPool4ResetsTheRecenterClock() public {
+    function test_reseedFromPool4IsTheOnlyWriteToLastRef() public {
         readyToBurn();
         hook.pokeAnchor();
         pool4Mock.setMarketOpen(false);
@@ -551,16 +521,14 @@ contract MedallionBurnTest is MedallionTestBase {
             hook.pokeAnchor();
         }
         assertEq(hook.anchor(), -1000);
-        vm.roll(hook.lastRefBlock() + hook.FALLBACK_RECENTER_BLOCKS());
-        hook.pokeAnchor();
-        assertEq(hook.lastRef(), -1000);
+        assertEq(hook.lastRef(), 0);
         pool4Mock.setMarketOpen(true);
         pool4Mock.setRefTick(50);
         vm.roll(block.number + 1);
         hook.pokeAnchor();
         assertEq(hook.lastRef(), 50);
-        assertEq(hook.lastRefBlock(), block.number);
         assertEq(hook.anchor(), 50);
+        assertEq(hook.blockAnchor(), 50);
     }
 
     function test_fallbackBurnUsesTheStartOfBlockAnchor() public {

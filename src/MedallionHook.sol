@@ -91,11 +91,10 @@ contract MedallionHook is IUnlockCallback {
     uint256 public constant MAX_SLIPPAGE_BPS = 400;
     /// @notice Largest move of the fallback anchor per block.
     int24 public constant ANCHOR_STEP = 200;
-    /// @notice The fallback anchor never leaves `lastRef` by more than this.
+    /// @notice The fallback anchor never leaves `lastRef` by more than this. `lastRef` is written only
+    /// from POOL4's own reference, so while POOL4 does not answer the band is fixed: a lasting move of
+    /// the plain pool beyond it is not followed, and burns stay refused until POOL4 answers again.
     int24 public constant FALLBACK_BAND = 1000;
-    /// @notice In fallback mode `lastRef` re-centres on the anchor once this many blocks have passed
-    /// since it was last written, so the band follows a lasting move instead of stranding the burns.
-    uint256 public constant FALLBACK_RECENTER_BLOCKS = 100;
 
     /// @notice LP fee of both ETH/IMD pools.
     uint24 public constant IMD_POOL_FEE = 10_000;
@@ -145,11 +144,10 @@ contract MedallionHook is IUnlockCallback {
     int24 public anchor;
     /// @notice The anchor as it was at the start of the block in which it last moved.
     int24 public blockAnchor;
-    /// @notice Centre of the fallback band: the last POOL4 reference, or, in fallback mode, the anchor
-    /// as of the last re-centre. Bounds the anchor to +-`FALLBACK_BAND`.
+    /// @notice Centre of the fallback band: the last reference POOL4 supplied. Written only by a seed
+    /// from POOL4 (constructor, normal-mode burn or `pokeAnchor()` while POOL4 answers); fallback mode
+    /// never changes it. Bounds the anchor to +-`FALLBACK_BAND`.
     int24 public lastRef;
-    /// @notice Block in which `lastRef` was last written (seed or re-centre).
-    uint256 public lastRefBlock;
     /// @notice Block in which the anchor was last seeded or stepped.
     uint256 public anchorBlock;
 
@@ -170,7 +168,6 @@ contract MedallionHook is IUnlockCallback {
     event LastFare(uint256 indexed tokenId, bytes32 indexed hash, string fare);
     event AnchorSeeded(int24 tick, uint256 blockNumber);
     event AnchorStepped(int24 from, int24 to, int24 target, uint256 blockNumber);
-    event BandRecentered(int24 from, int24 to, uint256 blockNumber);
     event IMDBurned(
         bool indexed viaPool4, bool indexed fallbackMode, uint256 ethIn, uint256 imdOut, int24 refTick, int24 spot
     );
@@ -571,7 +568,6 @@ contract MedallionHook is IUnlockCallback {
         anchor = ref;
         blockAnchor = ref;
         lastRef = ref;
-        lastRefBlock = block.number;
         anchorBlock = block.number;
         anchorSeeded = true;
         emit AnchorSeeded(ref, block.number);
@@ -580,20 +576,13 @@ contract MedallionHook is IUnlockCallback {
     /// @dev Fallback mode: once per block, the anchor moves at most `ANCHOR_STEP` toward the plain
     /// pool's spot tick clamped to `lastRef` +- `FALLBACK_BAND`. `blockAnchor` keeps the value the
     /// anchor had when the block started, which is the reference used by every burn in the block.
-    /// Once `FALLBACK_RECENTER_BLOCKS` blocks have passed since `lastRef` was written, the band
-    /// re-centres on the anchor before the step, so a lasting move of the plain pool beyond the band
-    /// is followed at no more than `FALLBACK_BAND` ticks per `FALLBACK_RECENTER_BLOCKS` blocks.
+    /// `lastRef` is never written here: the band is fixed until POOL4 supplies a new reference, so a
+    /// plain-pool move that stays more than `FALLBACK_BAND + MAX_REF_DEVIATION` ticks below `lastRef`
+    /// leaves the burns refused for as long as POOL4 stays silent.
     function _stepAnchor() internal {
         if (anchorBlock == block.number) return;
         (uint160 sqrtPriceX96, int24 spot,,) = poolManager.getSlot0(plainKey().toId());
         if (sqrtPriceX96 == 0) revert PoolUnavailable();
-
-        if (block.number >= lastRefBlock + FALLBACK_RECENTER_BLOCKS) {
-            int24 prev = lastRef;
-            lastRef = anchor;
-            lastRefBlock = block.number;
-            emit BandRecentered(prev, anchor, block.number);
-        }
 
         int24 lo = lastRef - FALLBACK_BAND;
         int24 hi = lastRef + FALLBACK_BAND;
